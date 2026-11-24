@@ -114,77 +114,164 @@ def import_base_data(db, payload):
 
 
 # ---------------------------------------------------------------- 重核引擎
+#
+# 内存边界：base context（课程学分 + 前置课规则）为 O(课程数 + 规则数)，
+# 允许随底表增长；学生学号、该生成绩单均以键集/游标逐行流过，应用内不保留
+# 随学生人数或单生单数增长的列表/字典。
+#
+# 取数复杂度：一项前置依据只走 idx_audit_evidence 覆盖索引做一次 LIMIT 1
+# 的 B 树定位（等值：学生/前置课/合规/通过；有序：结课日, 单号），
+# 取数与比较次数为 O(log 旧单数)，不随该前置课旧单总数线性增长。
 
-def recompute_student(db, student_id):
-    """重核一名学生并整体重写其核定底表。调用方负责事务（失败需回滚）。"""
-    now = now_iso()
-    credits_of = {r["course_id"]: r["credits"] for r in db.execute("SELECT course_id, credits FROM courses")}
+# 取某前置课在“本单开课日”前已结课的最优依据单：
+# 有效（核定表中只有有效单）、通过、本身合规；结课日最早，同日单号最小。
+# 由 idx_audit_evidence 覆盖索引支撑，取一条即得，不随旧单数线性扫描。
+EVIDENCE_SQL = """
+SELECT record_id FROM record_audit
+ WHERE student_id = ? AND course_id = ?
+   AND compliant = 1 AND passed = 1 AND end_date < ?
+ ORDER BY end_date ASC, record_id ASC
+ LIMIT 1
+"""
+
+# 同一门课选计分单：合规且通过者中结课日最早、同日单号最小（不看开课先后）。
+SCORING_SQL = """
+SELECT record_id FROM record_audit
+ WHERE student_id = ? AND course_id = ?
+   AND compliant = 1 AND passed = 1
+ ORDER BY end_date ASC, record_id ASC
+ LIMIT 1
+"""
+
+ACTIVE_RECORDS_SQL = """
+SELECT record_id, course_id, start_date, end_date, passed
+  FROM records
+ WHERE student_id = ? AND status = 'active'
+ ORDER BY start_date ASC, record_id ASC
+"""
+
+
+def load_base_context(db):
+    """底表上下文：学分表 + 每门课的必修前置课。规模 O(课程 + 规则)。"""
+    credits_of = {
+        r["course_id"]: r["credits"]
+        for r in db.execute("SELECT course_id, credits FROM courses")
+    }
     prereqs = defaultdict(list)
+    # 不显式排序：沿用旧版按底表写入（rowid）顺序输出逐前置课依据，保持接口形态稳定。
     for r in db.execute("SELECT course_id, prereq_course_id FROM prerequisites"):
         prereqs[r["course_id"]].append(r["prereq_course_id"])
+    return credits_of, dict(prereqs)
 
-    rows = db.execute(
-        "SELECT record_id, course_id, start_date, end_date, passed FROM records "
-        "WHERE student_id = ? AND status = 'active' ORDER BY start_date, record_id",
-        (student_id,),
-    ).fetchall()
 
-    by_course = defaultdict(list)
-    for r in rows:
-        by_course[r["course_id"]].append(r)
+def iter_student_ids(db):
+    """键集逐一生成学号：应用内只保留“上一个学号”标量，不一次载入全部学号。"""
+    last_id = None
+    while True:
+        if last_id is None:
+            row = db.execute(
+                "SELECT student_id FROM records ORDER BY student_id LIMIT 1"
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT student_id FROM records WHERE student_id > ? "
+                "ORDER BY student_id LIMIT 1",
+                (last_id,),
+            ).fetchone()
+        if row is None:
+            return
+        last_id = row["student_id"]
+        yield last_id
 
-    # 按开课日升序处理：依据单（结课日 < 本课开课日）必然先于本单被核定，
-    # 因此“依据单本身也须合规”在此自然满足，且不会成环。
-    compliant, evidences = {}, {}
-    for r in rows:
-        evidence, ok = {}, True
-        for pc in prereqs.get(r["course_id"], []):
-            best = None
-            for c in by_course.get(pc, []):
-                if c["end_date"] < r["start_date"] and c["passed"] and compliant.get(c["record_id"]):
-                    if best is None or (c["end_date"], c["record_id"]) < (best["end_date"], best["record_id"]):
-                        best = c
-            evidence[pc] = best["record_id"] if best else None
-            if best is None:
-                ok = False
-        compliant[r["record_id"]] = ok
-        evidences[r["record_id"]] = evidence
 
-    # 同一门课只计一次：结课最早、单号最小的合规且通过单
-    source_of = {}
-    for r in sorted(rows, key=lambda x: (x["end_date"], x["record_id"])):
-        if compliant[r["record_id"]] and r["passed"] and r["course_id"] not in source_of:
-            source_of[r["course_id"]] = r["record_id"]
+def recompute_all_students(db, base=None):
+    """底表导入后的全量重核：学号键集流过，底表上下文只载一次。调用方负责事务。"""
+    if base is None:
+        base = load_base_context(db)
+    count = 0
+    for student_id in iter_student_ids(db):
+        recompute_student(db, student_id, base=base)
+        count += 1
+    return count
+
+
+def recompute_student(db, student_id, base=None):
+    """重核一名学生并整体重写其核定底表。调用方负责事务（失败需回滚）。
+
+    全程逐行流式处理该生成绩单，不在应用内存堆积该生的全部旧单。
+    """
+    now = now_iso()
+    if base is None:
+        base = load_base_context(db)
+    credits_of, prereqs = base
 
     db.execute("DELETE FROM record_audit WHERE student_id = ?", (student_id,))
     db.execute("DELETE FROM course_credits WHERE student_id = ?", (student_id,))
     db.execute("DELETE FROM student_credits WHERE student_id = ?", (student_id,))
 
-    for r in rows:
+    # 第一遍：按（开课日, 单号）逐行核定合规性与前置依据，并立即写入核定表
+    # （counted 先置 0，第二遍再标记计分单）。
+    # 依据单须满足 end_date < 本课 start_date，而合法单据 start_date <= end_date，
+    # 故依据单开课日必然更早、已在本遍先处理并写入合规结论，递归合规自然成立。
+    records_checked = 0
+    audit_cur = db.execute(ACTIVE_RECORDS_SQL, (student_id,))
+    for r in audit_cur:
         rid = r["record_id"]
-        counted = 1 if source_of.get(r["course_id"]) == rid else 0
+        start = r["start_date"]
+        evidence, ok = {}, True
+        for pc in prereqs.get(r["course_id"], ()):  # 规则数，O(前置规则)
+            ev = db.execute(EVIDENCE_SQL, (student_id, pc, start)).fetchone()
+            ev_rid = ev["record_id"] if ev is not None else None
+            evidence[pc] = ev_rid
+            if ev_rid is None:
+                ok = False
+        compliant = 1 if ok else 0
         db.execute(
-            "INSERT INTO record_audit (record_id, student_id, course_id, passed, compliant, counted, evidence, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (rid, student_id, r["course_id"], r["passed"],
-             1 if compliant[rid] else 0, counted,
-             json.dumps(evidences[rid], ensure_ascii=False), now),
+            "INSERT INTO record_audit (record_id, student_id, course_id, passed,"
+            " compliant, counted, evidence, end_date, updated_at)"
+            " VALUES (?,?,?,?,?,0,?,?,?)",
+            (rid, student_id, r["course_id"], r["passed"], compliant,
+             json.dumps(evidence, ensure_ascii=False), r["end_date"], now),
         )
-    for cid, rid in source_of.items():
+        records_checked += 1
+
+    # 第二遍：逐门出现过的课程做一次索引 LIMIT 1 选计分单。
+    # DISTINCT 结果规模不超过底表课程数；这里同样逐行流过，不 fetchall 缓冲。
+    source_of = {}
+    total = 0.0
+    course_cur = db.execute(
+        "SELECT DISTINCT course_id FROM records "
+        "WHERE student_id = ? AND status = 'active'",
+        (student_id,),
+    )
+    for c_row in course_cur:
+        cid = c_row["course_id"]
+        win = db.execute(SCORING_SQL, (student_id, cid)).fetchone()
+        if win is None:
+            continue
+        rid = win["record_id"]
+        source_of[cid] = rid
         db.execute(
-            "INSERT INTO course_credits (student_id, course_id, source_record_id) VALUES (?,?,?)",
+            "UPDATE record_audit SET counted = 1 WHERE record_id = ?", (rid,)
+        )
+        db.execute(
+            "INSERT INTO course_credits (student_id, course_id, source_record_id)"
+            " VALUES (?,?,?)",
             (student_id, cid, rid),
         )
-    total = round(sum(credits_of.get(cid, 0.0) for cid in source_of), 6)
+        total += credits_of.get(cid, 0.0)
+
+    total = round(total, 6)
     db.execute(
-        "INSERT INTO student_credits (student_id, total_credits, updated_at) VALUES (?,?,?)",
+        "INSERT INTO student_credits (student_id, total_credits, updated_at)"
+        " VALUES (?,?,?)",
         (student_id, total, now),
     )
     return {
         "student_id": student_id,
         "total_credits": total,
         "credited_courses": len(source_of),
-        "records_checked": len(rows),
+        "records_checked": records_checked,
     }
 
 

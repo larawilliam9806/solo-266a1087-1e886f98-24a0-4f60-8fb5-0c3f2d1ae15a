@@ -9,6 +9,7 @@ from .logic import (
     ApiError,
     apply_transcript_batch,
     import_base_data,
+    iter_student_ids,
     recompute_student,
     revoke_record,
     student_snapshot,
@@ -24,7 +25,10 @@ def _wants_json():
 def _read_json_payload():
     """支持 application/json 正文、表单字段或上传文件三种来源。"""
     if request.is_json:
-        return request.get_json()
+        try:
+            return request.get_json()
+        except Exception as e:  # 畸形 JSON：按 400 业务错误处理，而非 500
+            raise ApiError(f"JSON 解析失败：{e}")
     if "file" in request.files and request.files["file"].filename:
         raw = request.files["file"].read()
     else:
@@ -111,13 +115,15 @@ def admin_base():
             payload = _read_json_payload()
             db.execute("BEGIN IMMEDIATE")
             summary = import_base_data(db, payload)
-            # 底表变更后，对已入账学生全部重核，保持核定底表一致（同事务）
-            students = [r["student_id"] for r in db.execute("SELECT DISTINCT student_id FROM records")]
-            for sid in students:
+            # 底表变更后，在同一事务内对已入账学生全部重核；
+            # 学号键集流过、不一次载入，失败抛错即整体回滚，底表与核定结果沿用原账。
+            students_recomputed = 0
+            for sid in iter_student_ids(db):
                 recompute_student(db, sid)
+                students_recomputed += 1
             db.execute("COMMIT")
             flash(f"底表已导入：课程 {summary['courses']} 门、前置课 {summary['prerequisites']} 条；"
-                  f"并重核 {len(students)} 名学生", "ok")
+                  f"并重核 {students_recomputed} 名学生", "ok")
         except ApiError as e:
             rollback_quietly(db)
             flash(e.message, "err")
@@ -150,9 +156,10 @@ def api_import_base():
         payload = _read_json_payload()
         db.execute("BEGIN IMMEDIATE")
         summary = import_base_data(db, payload)
-        students = [r["student_id"] for r in db.execute("SELECT DISTINCT student_id FROM records")]
-        for sid in students:
+        students_recomputed = 0
+        for sid in iter_student_ids(db):
             recompute_student(db, sid)
+            students_recomputed += 1
         db.execute("COMMIT")
     except ApiError as e:
         rollback_quietly(db)
@@ -160,7 +167,7 @@ def api_import_base():
     except Exception as e:
         rollback_quietly(db)
         return jsonify({"ok": False, "error": f"导入失败，底表未变更：{e}"}), 500
-    return jsonify({"ok": True, **summary, "students_recomputed": len(students)})
+    return jsonify({"ok": True, **summary, "students_recomputed": students_recomputed})
 
 
 @bp.route("/api/transcripts", methods=["POST"])

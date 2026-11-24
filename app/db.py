@@ -58,10 +58,42 @@ CREATE TABLE IF NOT EXISTS record_audit (
     compliant  INTEGER NOT NULL,            -- 修读是否合规
     counted    INTEGER NOT NULL,            -- 是否计入学分
     evidence   TEXT NOT NULL,               -- JSON: {前置课号: 依据单号或null}
+    end_date   TEXT NOT NULL DEFAULT '',    -- 结课日（冗余入核定表，供索引取最优依据）
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_student ON record_audit(student_id);
+
+-- 按学生以（开课日, 单号）顺序流式重核，避免排序/全量载入
+CREATE INDEX IF NOT EXISTS idx_records_student_start
+    ON records(student_id, status, start_date, record_id);
 """
+
+# 查一项前置依据的覆盖索引：等值定位 学生+前置课+合规+通过，
+# 再按（结课日, 单号）取第一条，取数/比较为 B 树对数级，不随该课旧单数线性增长。
+EVIDENCE_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_audit_evidence ON record_audit"
+    "(student_id, course_id, compliant, passed, end_date, record_id)"
+)
+
+
+def upgrade_db(conn):
+    """对旧版库做增量迁移：只加列/索引，不动既有账目数据（沿用旧库）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(record_audit)")}
+    if "end_date" not in cols:
+        # 旧核定表缺冗余结课日：加常量默认列，再从成绩单回填
+        conn.execute(
+            "ALTER TABLE record_audit ADD COLUMN end_date TEXT NOT NULL DEFAULT ''"
+        )
+        conn.execute(
+            "UPDATE record_audit SET end_date = COALESCE(("
+            " SELECT r.end_date FROM records r WHERE r.record_id = record_audit.record_id"
+            "), '9999-12-31') WHERE end_date = ''"
+        )
+    conn.execute(EVIDENCE_INDEX_SQL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_records_student_start"
+        " ON records(student_id, status, start_date, record_id)"
+    )
 
 
 def connect(db_path):
@@ -98,5 +130,6 @@ def init_db_file(db_path):
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        upgrade_db(conn)
     finally:
         conn.close()
